@@ -163,32 +163,61 @@ def fetch_subtitle(info: dict, cookies: dict) -> list[tuple[float, str]]:
         if len(inside) < len(out):
             print(f"[!] 字幕比视频长，已裁掉越界的 {len(out) - len(inside)} 段", file=sys.stderr)
 
-        # 护栏二：内容得和标题沾边（拦「时间戳合法但整段是别人视频」）
+        # 护栏二：内容得和标题沾边（拦「时间戳合法但整段是别人视频」）。
+        # 2026-10-29 改：这条只做「提醒」，不再直接拒——实测两边都会误判：
+        #   · 猪实验那类：正文是叙事，标题里的"科学家/深海/实验"根本不会念出来 → 误杀；
+        #   · 蚂蝗混进 harness 视频那类：标题词也确实不出现 → 该拦但拦不住靠词。
+        # 所以重叠度低时保留字幕、在笔记里标一句，让人自己核对，比默默丢掉好。
         if not title_matches(info["title"], "".join(t for _, t in inside)):
-            print("[!] 字幕内容和标题对不上，按无字幕处理", file=sys.stderr)
-            continue
+            print("[!] 字幕和标题字面重合度低，可能是错配——已保留，笔记里会标出来",
+                  file=sys.stderr)
+            info["subtitle_warn"] = True
 
         return inside
     return []
 
 
 def title_matches(title: str, text: str) -> bool:
-    """标题里的实词，至少有一个出现在正文里（宽松判断，避免误杀）。
+    """标题和正文是否沾边——用比例判断，不用"命中一个字就算"。
 
-    中文标题没法按空格切词，这里退一步：取标题里所有 2 字片段，
-    只要有一个出现在正文中就认。宁可放过，不要误杀真字幕。
+    2026-10-29 改：旧版只要标题里任意一个 2 字片段出现就算过，反过来只要
+    一个字都没出现在正文前 4000 字里就判死，会误杀真字幕（比如标题是
+    "海底10000米…"、正文里"海底"出现在 4000 字之后）。现在看两个比例：
+      · 标题 2 字片段在全文里的命中率 ≥ 15%
+      · 标题汉字在全文里的覆盖率 ≥ 40%
+    满足任一即认。标题没有汉字（外语标题）时不检查。
     """
-    probe = text[:4000]
-    grams = set()
-    for chunk in re.split(r"[^\w\u4e00-\u9fff]+", title):
-        chunk = re.sub(r"[0-9A-Za-z_]+", "", chunk)
-        for i in range(len(chunk) - 1):
-            g = chunk[i:i + 2]
-            if CJK.match(g[0]) and g not in STOP:
+    probe = text[:20000]
+    low = probe.lower()
+
+    # 先看标题里的拉丁词（DeepSeek / Harness / VSCode…）：这类词区分度最好，
+    # 只要有一个出现在正文里就够；标题有拉丁词但一个都没出现，直接判不沾边。
+    latin = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9]{3,}", title)]
+    if latin:
+        return any(w in low for w in latin)
+
+    chunks = [re.sub(r"[0-9A-Za-z_]+", "", c)
+              for c in re.split(r"[^\w\u4e00-\u9fff]+", title)]
+    chunks = [c for c in chunks if c]
+
+    grams, chars = set(), set()
+    for c in chunks:
+        for i in range(len(c) - 1):
+            g = c[i:i + 2]
+            # 只留"有区分度"的片段：泛词（是什么/到底/背后…）命中率天然很高，
+            # 留着会让任何一份错配字幕都通过检查
+            if CJK.match(g[0]) and g not in STOP_BIGRAMS:
                 grams.add(g)
+        for ch in c:
+            if CJK.match(ch):
+                chars.add(ch)
+
     if not grams:
-        return True
-    return any(g in probe for g in grams)
+        return True  # 标题只剩泛词（比如"这是什么"），无从比较，放过
+
+    gram_hit = sum(1 for g in grams if g in probe) / len(grams)
+    char_hit = (sum(1 for ch in chars if ch in probe) / len(chars)) if chars else 0.0
+    return gram_hit >= 0.25 or char_hit >= 0.60
 
 
 def download_audio(info: dict, cookies: dict) -> str:
@@ -258,6 +287,14 @@ STOP = {
     "因为", "所以", "但是", "可以", "一个", "这样", "那样", "现在", "时候",
     "如果", "还是", "已经", "不是", "没有", "自己", "知道", "觉得", "其实",
     "非常", "真的", "一下", "一些", "很多", "这种", "那种", "而且", "或者",
+}
+
+# 标题里常见但没区分度的 2 字片段（"是什么/到底/背后/运作"这类，几乎每个
+# 视频都会出现）。判断标题与正文是否沾边时必须先剔除，否则任何字幕都能蒙混过关。
+STOP_BIGRAMS = STOP | {
+    "是什", "么是", "到底", "为什", "背后", "运作", "怎么", "怎样", "如何",
+    "的什", "什东", "东西", "到底", "哪些", "哪种", "几个", "一些", "以及",
+    "这样", "那样", "不是", "就是", "都会", "会怎", "么样", "看看", "一起",
 }
 
 
@@ -342,6 +379,8 @@ def build_note(info: dict, segments: list[tuple[float, str]], source: str) -> st
     lines.append(f"- 时长：{mmss(info['duration'])}")
     lines.append(f"- 链接：https://www.bilibili.com/video/{info['bvid']}")
     lines.append(f"- 文本来源：{source}")
+    if info.get("subtitle_warn"):
+        lines.append("- ⚠️ 字幕与标题字面重合度低，**可能不是这条视频的字幕**，请对照视频核对")
     lines.append("")
     if info.get("desc"):
         lines.append("> " + info["desc"].replace("\n", "\n> "))
@@ -404,6 +443,8 @@ def main() -> int:
     ap.add_argument("-o", "--out", help="输出文件；给多个视频时当作目录")
     ap.add_argument("--model", default="small", help="Whisper 模型：tiny/base/small/medium")
     ap.add_argument("--no-asr", action="store_true", help="没字幕就报错，不做本地转写")
+    ap.add_argument("-j", "--jobs", type=int, default=3,
+                    help="并行处理的条数（默认 3；本地转写很吃 CPU，转写多时建议调小到 1-2）")
     args = ap.parse_args()
 
     cookies = load_cookies()
@@ -411,31 +452,48 @@ def main() -> int:
     if out_is_dir:
         os.makedirs(args.out, exist_ok=True)
 
-    failed = []
-    for i, target in enumerate(args.targets, 1):
-        tag = f"[{i}/{len(args.targets)}] " if len(args.targets) > 1 else ""
+    total = len(args.targets)
+    jobs = max(1, min(args.jobs, total))
+    failed: list[str] = []
+
+    def work(idx: int, target: str):
+        tag = f"[{idx}/{total}] " if total > 1 else ""
         try:
             note = one(target, cookies, args)
         except NoteError as e:
             print(f"{tag}✗ {target}：{e}", file=sys.stderr)
-            failed.append(target)
-            continue
-        except KeyboardInterrupt:
-            print("\n已中断。", file=sys.stderr)
-            return 130
-
+            return target, None
+        # 输出放在工作线程里也没问题：每个文件互不相同，stderr 打印也是行级的
+        path = None
         if out_is_dir:
-            bv = resolve_target(target)
-            path = os.path.join(args.out, f"{bv}.md")
-        else:
+            path = os.path.join(args.out, f"{resolve_target(target)}.md")
+        elif args.out:
             path = args.out
-
         if path:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(note)
             print(f"{tag}→ {path}", file=sys.stderr)
         else:
             print(note)
+        return target, note
+
+    if jobs == 1 or total == 1:
+        for i, t in enumerate(args.targets, 1):
+            target, _ = work(i, t)
+            if _ is None:
+                failed.append(target)
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(work, i, t) for i, t in enumerate(args.targets, 1)]
+            for fut in as_completed(futures):
+                try:
+                    target, note = fut.result()
+                except KeyboardInterrupt:
+                    print("\n已中断。", file=sys.stderr)
+                    return 130
+                if note is None:
+                    failed.append(target)
 
     if failed:
         print(f"\n有 {len(failed)} 条没成功：{', '.join(failed)}", file=sys.stderr)
