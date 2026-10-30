@@ -293,38 +293,56 @@ STOP = {
 # 视频都会出现）。判断标题与正文是否沾边时必须先剔除，否则任何字幕都能蒙混过关。
 STOP_BIGRAMS = STOP | {
     "是什", "么是", "到底", "为什", "背后", "运作", "怎么", "怎样", "如何",
-    "的什", "什东", "东西", "到底", "哪些", "哪种", "几个", "一些", "以及",
+    "这是", "的什", "什东", "东西", "到底", "哪些", "哪种", "几个", "一些", "以及",
     "这样", "那样", "不是", "就是", "都会", "会怎", "么样", "看看", "一起",
 }
 
 
 def tidy(text: str) -> str:
-    t = re.sub(r"\s+", "", text)
-    if not t:
+    """清空白，但**不补句号**——补句号是整句的事，不是每个片段的事。"""
+    return re.sub(r"\s+", "", text)
+
+
+def _finish(sentence: str) -> str:
+    """给一整句收尾：末尾没标点才补一个句号。"""
+    if not sentence:
         return ""
-    if t[-1] not in PUNCT:
-        t += "。"
-    return t
+    if sentence[-1] not in PUNCT:
+        sentence += "。"
+    return sentence
 
 
 def to_sentences(segments: list[tuple[float, str]]) -> list[tuple[float, str]]:
-    """按时间空档切句：停顿超过 0.55 秒算一句结束。"""
+    """按时间空档切句：停顿超过 0.55 秒算一句结束。
+
+    2026-10-30 修（阿汐的测试抓出来的）：原来先 append 再判空档，导致
+    「新一句的开头」被吞进上一句，句子越切越少；而且每个片段都补句号，
+    拼起来一句里出现好几个句号。现在顺序反过来：先判空档再 append，
+    句号只在整句结束时补一次。
+    """
     out: list[tuple[float, str]] = []
-    buf, start, prev_end = [], 0.0, None
+    buf: list[str] = []
+    start = 0.0
+    prev_end: float | None = None
+
     for t, text in segments:
         text = tidy(text)
         if not text:
             continue
+
+        gap = (t - prev_end) if prev_end is not None else None
+        # 空档够长 → 先把上一句收掉，再开新句
+        if buf and gap is not None and gap > 0.55:
+            out.append((start, _finish("".join(buf))))
+            buf = []
+
         if not buf:
             start = t
         buf.append(text)
-        gap = t - prev_end if prev_end is not None else None
         prev_end = t
-        if gap is not None and gap > 0.55:
-            out.append((start, "".join(buf)))
-            buf = []
+
     if buf:
-        out.append((start, "".join(buf)))
+        out.append((start, _finish("".join(buf))))
     return out
 
 
@@ -393,22 +411,24 @@ def build_note(info: dict, segments: list[tuple[float, str]], source: str) -> st
             lines.append(f"- [{mmss(t)}] {s}")
         lines.append("")
 
-    lines.append("## 正文（带时间戳）")
-    lines.append("")
-    buf, start, prev_t = [], 0.0, None
-    for t, s in sentences:
-        if not buf:
-            start = t
-        buf.append(s)
-        long_pause = prev_t is not None and t - prev_t > 3.0
-        prev_t = t
-        if sum(len(x) for x in buf) >= 150 or long_pause:
+    # 没有句子就别渲染空的「## 正文」（2026-10-30 修：阿汐的测试抓到的）
+    if sentences:
+        lines.append("## 正文（带时间戳）")
+        lines.append("")
+        buf, start, prev_t = [], 0.0, None
+        for t, s in sentences:
+            if not buf:
+                start = t
+            buf.append(s)
+            long_pause = prev_t is not None and t - prev_t > 3.0
+            prev_t = t
+            if sum(len(x) for x in buf) >= 150 or long_pause:
+                lines.append(f"**[{mmss(start)}]** " + "".join(buf))
+                lines.append("")
+                buf = []
+        if buf:
             lines.append(f"**[{mmss(start)}]** " + "".join(buf))
             lines.append("")
-            buf = []
-    if buf:
-        lines.append(f"**[{mmss(start)}]** " + "".join(buf))
-        lines.append("")
 
     total = sum(len(t) for _, t in segments)
     lines.append(f"---\n\n共 {len(sentences)} 句 / 约 {total} 字。")
